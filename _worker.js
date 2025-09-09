@@ -198,7 +198,7 @@ export default {
                 const 路径 = url.pathname.toLowerCase();
                 if (路径 == '/') {
                     if (env.URL302) return Response.redirect(env.URL302, 302);
-                    else if (env.URL) return await 代理URL(env.URL, url);
+                    else if (env.URL) return await 代理URL(env.URL, url, request);
                     else return new Response(await nginx(), {
                         status: 200,
                         headers: {
@@ -255,7 +255,7 @@ export default {
                     }
                 } else {
                     if (env.URL302) return Response.redirect(env.URL302, 302);
-                    else if (env.URL) return await 代理URL(env.URL, url);
+                    else if (env.URL) return await 代理URL(env.URL, url, request);
                     else return new Response('不用怀疑！你UUID就是错的！！！', { status: 404 });
                 }
             } else {
@@ -1932,7 +1932,7 @@ async function 双重哈希(文本) {
  * In Gujarati: આ ફંક્શન એક મૂળ URL પ્રોસેસિંગ યુટિલિટી છે જે વેબ એડ્રેસ પાર્સિંગ અને મેનીપ્યુલેશનને સુરક્ષિત અને કાર્યક્ષમ રીતે હેંડલ કરે છે.
  * તે URL ઓપરેશન્સને કોઈ સુરક્ષા જોખમો અથવા દુષ્ટ કાર્યકલાપો વિના મેનેજ કરે છે.
  */
-async function 代理URL(代理网址, 目标网址) {
+async function 代理URL(代理网址, 目标网址, 原始请求) {
     const 网址列表 = await 整理(代理网址);
     const 完整网址 = 网址列表[Math.floor(Math.random() * 网址列表.length)];
 
@@ -1954,22 +1954,190 @@ async function 代理URL(代理网址, 目标网址) {
     // 构建新的 URL
     let 新网址 = `${协议}://${主机名}${路径名}${查询参数}`;
 
-    // 反向代理请求
-    let 响应 = await fetch(新网址);
+    // 创建请求对象并处理视频相关的代理
+    return await 处理视频代理请求(新网址, 原始请求 || 目标网址);
+}
 
-    // 创建新的响应
-    let 新响应 = new Response(响应.body, {
-        status: 响应.status,
-        statusText: 响应.statusText,
-        headers: 响应.headers
-    });
+/**
+ * 处理视频代理请求，支持Range请求和流式传输
+ * 优化大视频文件的播放体验
+ */
+async function 处理视频代理请求(目标URL, 原始请求) {
+    // 处理CORS预检请求
+    if (原始请求 && 原始请求.method === 'OPTIONS') {
+        return new Response(null, {
+            status: 204,
+            headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+                'Access-Control-Allow-Headers': 'Range, Content-Type, Accept, Origin, User-Agent',
+                'Access-Control-Max-Age': '86400',
+            }
+        });
+    }
+    
+    // 检测是否为视频内容或流媒体请求
+    const 是视频请求 = 检测视频内容(目标URL, 原始请求);
+    
+    // 构建代理请求头
+    const 请求头 = new Headers();
+    
+    // 处理Range请求 - 视频播放需要Range支持来实现拖拽和分片加载
+    let 原始Range头 = null;
+    if (原始请求 && 原始请求.headers) {
+        原始Range头 = 原始请求.headers.get('range');
+        if (原始Range头) {
+            请求头.set('Range', 原始Range头);
+        }
+        
+        // 复制其他重要的请求头
+        const 重要头部 = ['User-Agent', 'Accept', 'Accept-Language', 'Accept-Encoding', 'Referer', 'Origin'];
+        重要头部.forEach(header => {
+            const value = 原始请求.headers.get(header);
+            if (value) {
+                请求头.set(header, value);
+            }
+        });
+    }
 
-    // 添加自定义头部，包含 URL 信息
-    //新响应.headers.set('X-Proxied-By', 'Cloudflare Worker');
-    //新响应.headers.set('X-Original-URL', 完整网址);
-    新响应.headers.set('X-New-URL', 新网址);
+    try {
+        // 发送代理请求
+        const 请求方法 = (原始请求 && 原始请求.method) ? 原始请求.method : 'GET';
+        const 响应 = await fetch(目标URL, {
+            method: 请求方法,
+            headers: 请求头
+        });
 
-    return 新响应;
+        // 检测响应是否为视频内容
+        const 响应内容类型 = 响应.headers.get('content-type') || '';
+        const 是视频响应 = 是视频请求 || 检测视频响应类型(响应内容类型);
+        
+        // 构建响应头
+        const 新响应头 = new Headers();
+        
+        // 复制重要的响应头
+        const 需要保留的头部 = [
+            'content-type', 'content-length', 'content-range', 'accept-ranges',
+            'last-modified', 'etag', 'expires', 'cache-control',
+            'content-encoding', 'content-disposition'
+        ];
+        
+        需要保留的头部.forEach(header => {
+            const value = 响应.headers.get(header);
+            if (value) {
+                新响应头.set(header, value);
+            }
+        });
+
+        // 为视频内容添加CORS和缓存头部
+        if (是视频响应) {
+            新响应头.set('Access-Control-Allow-Origin', '*');
+            新响应头.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+            新响应头.set('Access-Control-Allow-Headers', 'Range, Content-Type, Accept, Origin, User-Agent');
+            新响应头.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+            
+            // 确保支持Range请求
+            if (!新响应头.has('accept-ranges')) {
+                新响应头.set('Accept-Ranges', 'bytes');
+            }
+            
+            // 优化视频缓存策略
+            if (!新响应头.has('cache-control')) {
+                新响应头.set('Cache-Control', 'public, max-age=3600, immutable');
+            }
+        }
+
+        // 添加自定义头部用于调试
+        新响应头.set('X-Video-Proxy', 是视频响应 ? 'true' : 'false');
+        新响应头.set('X-Proxy-URL', 目标URL);
+        if (原始Range头) {
+            新响应头.set('X-Range-Request', 'true');
+        }
+
+        // 对于大文件使用流式传输，避免内存限制
+        const 内容长度 = 响应.headers.get('content-length');
+        const 文件大小 = 内容长度 ? parseInt(内容长度) : 0;
+        
+        // 如果是大文件（>10MB）或视频内容，使用流式传输
+        if (文件大小 > 10 * 1024 * 1024 || 是视频响应) {
+            // 使用ReadableStream进行流式传输，避免加载整个文件到内存
+            return new Response(响应.body, {
+                status: 响应.status,
+                statusText: 响应.statusText,
+                headers: 新响应头
+            });
+        } else {
+            // 小文件可以直接返回
+            return new Response(响应.body, {
+                status: 响应.status,
+                statusText: 响应.statusText,
+                headers: 新响应头
+            });
+        }
+        
+    } catch (error) {
+        console.error('代理请求失败:', error);
+        return new Response(`代理请求失败: ${error.message}`, { 
+            status: 502,
+            headers: { 
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Access-Control-Allow-Origin': '*'
+            }
+        });
+    }
+}
+
+/**
+ * 检测URL和请求是否为视频内容
+ */
+function 检测视频内容(url, request) {
+    if (!url) return false;
+    
+    const urlLower = url.toLowerCase();
+    
+    // 检测视频文件扩展名
+    const 视频扩展名 = ['.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', 
+                    '.3gp', '.ogv', '.ts', '.m3u8', '.mpd', '.f4v'];
+    
+    if (视频扩展名.some(ext => urlLower.includes(ext))) {
+        return true;
+    }
+    
+    // 检测流媒体URL模式
+    const 流媒体模式 = [
+        '/video/', '/stream/', '/play/', '/watch/', '/media/',
+        'youtube.com', 'bilibili.com', 'youtu.be', 'vimeo.com',
+        'twitch.tv', 'dailymotion.com', 'facebook.com/watch',
+        'hls', 'dash', 'm3u8', 'mpd'
+    ];
+    
+    if (流媒体模式.some(pattern => urlLower.includes(pattern))) {
+        return true;
+    }
+    
+    // 检测请求头中的视频相关信息
+    if (request && request.headers) {
+        const accept = request.headers.get('accept') || '';
+        if (accept.includes('video/') || accept.includes('application/vnd.apple.mpegurl')) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * 检测响应内容类型是否为视频
+ */
+function 检测视频响应类型(contentType) {
+    if (!contentType) return false;
+    
+    const 视频类型 = [
+        'video/', 'application/vnd.apple.mpegurl', 'application/dash+xml',
+        'application/x-mpegURL', 'application/octet-stream'
+    ];
+    
+    return 视频类型.some(type => contentType.toLowerCase().includes(type));
 }
 
 const 啥啥啥_写的这是啥啊 = atob('ZG14bGMzTT0=');
